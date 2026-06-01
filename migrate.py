@@ -8,6 +8,7 @@ Design (following Pi's subagent extension pattern):
     → Visible in /tree with distinct styling
     → Participates in LLM context
   - Subagent content interleaved chronologically with parent messages
+    - Includes all part types: text, reasoning, tool calls, tool results, files
   - No separate JSONL files for subagent children
 
 Usage:
@@ -63,19 +64,22 @@ def make_usage(tokens, cost_val):
     }
 
 
-# ── Fetch child session data ───────────────────────────────────────-
+# ── Fetch child session data ───────────────────────────────────────
 
-def fetch_child_messages(cursor, parent_id):
+def fetch_child_messages(conn, parent_id):
     """Fetch all subagent child messages for a parent session.
-    
-    Returns list of (timestamp, agent_key, agent_display, title, role, text)
+
+    Returns list of (timestamp, agent_key, agent_display, title, role, formatted_text)
     sorted by timestamp. Each item represents one child message.
+    Includes all part types: text, reasoning, tool, file.
     """
-    cursor.execute(
+    cur = conn.cursor()
+    cur.execute(
         "SELECT id, title, agent FROM session WHERE parent_id = ? ORDER BY time_created",
         (parent_id,)
     )
-    children = cursor.fetchall()
+    children = cur.fetchall()
+    cur.close()
 
     if not children:
         return []
@@ -95,11 +99,16 @@ def fetch_child_messages(cursor, parent_id):
         agent_display = cagent or "subagent"
         title = ctitle or "(untitled)"
 
-        cursor.execute(
-            "SELECT time_created, data FROM message WHERE session_id = ? ORDER BY time_created, id",
+        # Fetch all messages for this child session
+        cur2 = conn.cursor()
+        cur2.execute(
+            "SELECT id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created, id",
             (cid,)
         )
-        for ts, djson in cursor:
+        all_msgs = cur2.fetchall()
+        cur2.close()
+
+        for mid, ts, djson in all_msgs:
             try:
                 data = json.loads(djson)
             except:
@@ -107,31 +116,56 @@ def fetch_child_messages(cursor, parent_id):
             role = data.get("role")
             if role not in ("user", "assistant"):
                 continue
-            # Fetch message id, then text parts
-            c2 = cursor.connection.cursor()
-            c2.execute(
-                "SELECT id FROM message WHERE session_id = ? AND time_created = ? AND data = ?",
-                (cid, ts, djson)
-            )
-            row2 = c2.fetchone()
-            if not row2:
-                continue
-            mid = row2[0]
-            c2.execute(
-                "SELECT data FROM part WHERE message_id = ? AND json_extract(data, '$.type') = 'text' "
-                "ORDER BY time_created, id",
+
+            # Fetch all parts (not just text) for this message
+            cur3 = conn.cursor()
+            cur3.execute(
+                "SELECT data FROM part WHERE message_id = ? ORDER BY time_created, id",
                 (mid,)
             )
-            texts = []
-            for (pj,) in c2:
+            all_parts = cur3.fetchall()
+            cur3.close()
+
+            # Format each part into readable text
+            formatted_parts = []
+            for (pj,) in all_parts:
                 try:
                     prt = json.loads(pj)
-                    texts.append(prt.get("text", ""))
                 except:
-                    pass
-            text = "\n".join(texts).strip()
-            if text:
-                items.append((ts, key, agent_display, title, role, text))
+                    continue
+
+                t = prt.get("type", "")
+                if t == "text":
+                    txt = prt.get("text", "")
+                    if txt.strip():
+                        formatted_parts.append(txt)
+                elif t == "reasoning":
+                    txt = prt.get("text", "")
+                    if txt.strip():
+                        formatted_parts.append(f"[思考] {txt}")
+                elif t == "tool":
+                    tool_name = prt.get("tool", "")
+                    state = prt.get("state", {})
+                    status = state.get("status", "")
+                    inp = state.get("input", {})
+                    out = state.get("output", state.get("error", ""))
+                    formatted_parts.append(f"[tool: {tool_name}] {json.dumps(inp, ensure_ascii=False)}")
+                    if status == "completed" and out:
+                        # Truncate very long output
+                        out_str = out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
+                        if len(out_str) > 500:
+                            out_str = out_str[:500] + "..."
+                        formatted_parts.append(f"[result] {out_str}")
+                    elif status == "error":
+                        err_str = out if isinstance(out, str) else str(out)
+                        formatted_parts.append(f"[error] {err_str[:200]}")
+                elif t == "file":
+                    fpath = prt.get("path", prt.get("file", ""))
+                    formatted_parts.append(f"[file] {fpath}")
+
+            full_text = "\n".join(formatted_parts).strip()
+            if full_text:
+                items.append((ts, key, agent_display, title, role, full_text))
 
     items.sort(key=lambda x: x[0])
     return items
@@ -168,10 +202,14 @@ def show_status(st, conn):
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM session")
     (total_oc,) = cursor.fetchone()
+    cursor.close()
     total_pi = len(migrated)
     # Only count entries whose files still exist
-    files_exist = sum(1 for s in migrated.values()
-                      if os.path.exists(os.path.join(PI_SESSION_DIR, s.get("pi_file", ""))))
+    files_exist = 0
+    for s in migrated.values():
+        p = os.path.join(PI_SESSION_DIR, s.get("pi_file", ""))
+        if os.path.exists(p):
+            files_exist += 1
     remaining = total_oc - files_exist
     n_custom = sum(s.get("n_custom", 0) for s in migrated.values())
     n_msgs = sum(s.get("n_messages", 0) for s in migrated.values())
@@ -198,8 +236,10 @@ def show_status(st, conn):
         print(f"Orphaned refs: {orphaned} (state file references deleted Pi files)")
 
     if remaining > 0:
+        cursor = conn.cursor()
         cursor.execute("SELECT id, title, time_created FROM session ORDER BY time_created DESC")
         all_sessions = cursor.fetchall()
+        cursor.close()
         newest_not = None
         for srow in all_sessions:
             ocid = str(srow["id"])
@@ -214,7 +254,7 @@ def show_status(st, conn):
 
 def msg_to_entries(msg_data, parts, ts, cur_provider, cur_model, last_eid):
     """Convert one OpenCode message to Pi entries.
-    
+
     Returns (entries_list, new_last_eid, new_provider, new_model).
     """
     entries = []
@@ -281,25 +321,49 @@ def msg_to_entries(msg_data, parts, ts, cur_provider, cur_model, last_eid):
             entries.append(entry)
             last_eid = eid
 
-        # Tool results
-        for tl in tools:
+        # Tool results (with unique timestamps: ts + 1 + idx)
+        for idx, tl in enumerate(tools):
             teid = make_eid()
             entries.append({"type": "message", "id": teid, "parentId": last_eid,
-                            "timestamp": to_iso(ts + 1), "message": {
+                            "timestamp": to_iso(ts + 1 + idx), "message": {
                                 "role": "toolResult",
                                 "toolCallId": tl.get("callID", "call_unknown"),
                                 "toolName": tl.get("tool", "unknown"),
                                 "content": [{"type": "text", "text": str(tl.get("state", {}).get("output", "") or "")}],
                                 "isError": tl.get("state", {}).get("status") == "error",
-                                "timestamp": ts + 1}})
+                                "timestamp": ts + 1 + idx}})
             last_eid = teid
 
     return entries, last_eid, cur_provider, cur_model
 
 
+# ── Helper: append custom_message entry ──────────────────────────
+
+def _append_custom_message(lines, parent_id, child):
+    """Append a custom_message entry for a subagent child message. Returns new parent ID."""
+    c_ts, c_key, c_agent, c_title, c_role, c_text = child
+    role_label = "User" if c_role == "user" else "Assistant"
+    display_text = (
+        f"[Subagent: {c_agent}] Task: {c_title}\n"
+        f"--- Begin subagent conversation ---\n"
+        f"{role_label}: {c_text}\n"
+        f"--- End subagent conversation ---"
+    )
+    ceid = make_eid()
+    lines.append(json.dumps({
+        "type": "custom_message",
+        "id": ceid, "parentId": parent_id,
+        "timestamp": to_iso(c_ts),
+        "customType": f"subagent/{c_key}",
+        "content": display_text,
+        "display": True,
+    }))
+    return ceid
+
+
 # ── Convert one session ─────────────────────────────────────────────
 
-def convert_session(cursor, session_row):
+def convert_session(conn, session_row):
     """Convert OpenCode session → Pi JSONL lines + target path."""
     sid = session_row["id"]
     directory = session_row["directory"] or ""
@@ -320,16 +384,44 @@ def convert_session(cursor, session_row):
               "timestamp": to_iso(t_created), "cwd": cwd}
     lines = [json.dumps(header)]
 
-    # Build initial entries (session_info, model_change, thinking_level_change)
+    # ── Fetch parent messages ────────────────────────────────────
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created, id",
+        (sid,)
+    )
+    parent_rows = cursor.fetchall()
+    cursor.close()
+
+    parent_msgs = []
+    for mid, ts, djson in parent_rows:
+        try:
+            data = json.loads(djson)
+        except:
+            continue
+        if data.get("role") not in ("user", "assistant"):
+            continue
+        cur2 = conn.cursor()
+        cur2.execute("SELECT data FROM part WHERE message_id = ? ORDER BY time_created, id", (mid,))
+        parts = []
+        for (pj,) in cur2:
+            try:
+                parts.append(json.loads(pj))
+            except:
+                pass
+        cur2.close()
+        parent_msgs.append((mid, ts, data, parts))
+
+    # ── Fetch child messages ─────────────────────────────────────
+    child_msgs = fetch_child_messages(conn, sid)
+
+    # ── Build initial entries (model_change, thinking_level_change) ──
+    # NOTE: session_info is appended at the END, not here.
+    # Pi native convention: non-tree metadata entries at the end.
     led = None
     head_entries = []
-    if title:
-        e = make_eid()
-        head_entries.append({"type": "session_info", "id": e, "parentId": None,
-                             "timestamp": to_iso(t_created), "name": f"[OC] {title}"})
-        led = e
     e = make_eid()
-    head_entries.append({"type": "model_change", "id": e, "parentId": led,
+    head_entries.append({"type": "model_change", "id": e, "parentId": None,
                          "timestamp": to_iso(t_created), "provider": provider_id, "modelId": model_id})
     led = e
     e = make_eid()
@@ -340,39 +432,10 @@ def convert_session(cursor, session_row):
     for ent in head_entries:
         lines.append(json.dumps(ent))
 
-    # ── Fetch parent messages ────────────────────────────────────
-    cursor.execute(
-        "SELECT id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created, id",
-        (sid,)
-    )
-    parent_msgs = []
-    for mid, ts, djson in cursor:
-        try:
-            data = json.loads(djson)
-        except:
-            continue
-        if data.get("role") not in ("user", "assistant"):
-            continue
-        c2 = cursor.connection.cursor()
-        c2.execute("SELECT data FROM part WHERE message_id = ? ORDER BY time_created, id", (mid,))
-        parts = []
-        for (pj,) in c2:
-            try:
-                parts.append(json.loads(pj))
-            except:
-                pass
-        parent_msgs.append((mid, ts, data, parts))
-
-    # ── Fetch child messages ─────────────────────────────────────
-    child_msgs = fetch_child_messages(cursor, sid)
-
     # ── Merge: interleave child messages between parent messages ──
     cur_provider = provider_id
     cur_model = model_id
 
-    # We iterate through parent messages. After each parent message,
-    # we flush any child messages whose timestamp falls between this
-    # parent message and the next one.
     for i, (mid, ts, data, parts) in enumerate(parent_msgs):
         # Convert parent message
         conv, led, cur_provider, cur_model = msg_to_entries(
@@ -387,31 +450,26 @@ def convert_session(cursor, session_row):
         remaining = []
         for child in child_msgs:
             c_ts = child[0]
-            if c_ts >= ts and c_ts < next_ts:
-                # Insert as custom_message
-                c_key, c_agent, c_title, c_role, c_text = child[1], child[2], child[3], child[4], child[5]
-                role_label = "User" if c_role == "user" else "Assistant"
-                display_text = (
-                    f"[Subagent: {c_agent}] Task: {c_title}\n"
-                    f"--- Begin subagent conversation ---\n"
-                    f"{role_label}: {c_text}\n"
-                    f"--- End subagent conversation ---"
-                )
-                ceid = make_eid()
-                lines.append(json.dumps({
-                    "type": "custom_message",
-                    "id": ceid, "parentId": led,
-                    "timestamp": to_iso(c_ts),
-                    "customType": f"subagent/{c_key}",
-                    "content": display_text,
-                    "display": True,
-                }))
-                led = ceid
+            if c_ts > ts and c_ts < next_ts:
+                led = _append_custom_message(lines, led, child)
             else:
                 remaining.append(child)
         child_msgs = remaining
 
-    return lines, target_path
+    # ⚠️ Flush any remaining child messages that fall after the last parent message
+    for child in child_msgs:
+        led = _append_custom_message(lines, led, child)
+
+    # ── Append session_info at the end (Pi native convention) ─────
+    if title:
+        e = make_eid()
+        lines.append(json.dumps({
+            "type": "session_info", "id": e, "parentId": led,
+            "timestamp": to_iso(t_created),
+            "name": f"[OC] {title}",
+        }))
+
+    return lines, target_path, sess_uuid
 
 
 # ── Main ────────────────────────────────────────────────────────────
@@ -439,19 +497,23 @@ def main():
 
     conn = sqlite3.connect(OPENCODE_DB)
     conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
 
     if args.status:
         show_status(load_state(), conn)
         conn.close()
         return
 
+    cursor = conn.cursor()
     cursor.execute("SELECT * FROM session ORDER BY time_created DESC")
     all_sessions = cursor.fetchall()
+    cursor.close()
     print(f"Found {len(all_sessions)} sessions")
 
+    cursor = conn.cursor()
     cursor.execute("SELECT parent_id, COUNT(*) FROM session WHERE parent_id IS NOT NULL GROUP BY parent_id")
-    pc = {r["parent_id"]: r["COUNT(*)"] for r in cursor.fetchall()}
+    pc_rows = cursor.fetchall()
+    cursor.close()
+    pc = {r["parent_id"]: r["COUNT(*)"] for r in pc_rows}
     print(f"  {len(pc)} parents, {sum(pc.values())} children")
 
     if args.dir:
@@ -492,7 +554,7 @@ def main():
         tag = f"({pc[row['id']]} children)" if has_kids else ""
         print(f"[{idx}/{len(to_process)}] {title} {tag}...", end="", flush=True)
         try:
-            lines, target_path = convert_session(cursor, row)
+            lines, target_path, sess_uuid = convert_session(conn, row)
             if args.dry_run:
                 n_msg = sum(1 for l in lines[1:] if json.loads(l).get("type") == "message")
                 n_cst = sum(1 for l in lines[1:] if json.loads(l).get("type") == "custom_message")
@@ -501,7 +563,7 @@ def main():
                 os.makedirs(os.path.dirname(target_path), exist_ok=True)
                 with open(target_path, "w") as f:
                     f.write("\n".join(lines) + "\n")
-                # Record in state (relative path for portability)
+                # Record in state
                 if state is not None:
                     rel = os.path.relpath(target_path, PI_SESSION_DIR)
                     n_msg = sum(1 for l in lines[1:] if json.loads(l).get("type") == "message")
@@ -511,6 +573,7 @@ def main():
                         "time_created": row["time_created"],
                         "time_migrated": int(datetime.now().timestamp() * 1000),
                         "pi_file": rel,
+                        "pi_session_id": sess_uuid,   # fallback: pi --session <id>
                         "n_messages": n_msg,
                         "n_custom": n_cst,
                     }

@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Editor
+.vscode/
+*.swp
+*.swo
+
+# Migration state (generated at runtime in PI_SESSION_DIR)
+.migration-state.json

@@ -326,7 +326,7 @@ def convert_session(cursor, session_row):
     if title:
         e = make_eid()
         head_entries.append({"type": "session_info", "id": e, "parentId": None,
-                             "timestamp": to_iso(t_created), "name": title})
+                             "timestamp": to_iso(t_created), "name": f"[OC] {title}"})
         led = e
     e = make_eid()
     head_entries.append({"type": "model_change", "id": e, "parentId": led,

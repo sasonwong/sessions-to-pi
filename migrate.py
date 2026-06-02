@@ -483,7 +483,7 @@ def main():
     )
     parser.add_argument("--all", action="store_true", help="Migrate all sessions (overrides --limit)")
     parser.add_argument("--incremental", action="store_true",
-                        help="Skip sessions already recorded in migration state")
+                        help="Skip already-migrated sessions (state is always recorded)")
     parser.add_argument("--dry-run", action="store_true", help="Stats only")
     parser.add_argument("--status", action="store_true", help="Show migration status and exit")
     parser.add_argument("--dir", type=str, help="Only sessions from this dir prefix")
@@ -529,8 +529,6 @@ def main():
         skipped = before - len(all_sessions)
         if skipped:
             print(f"  Skipped (already migrated): {skipped}")
-    else:
-        state = None  # don't update state in non-incremental mode
 
     if args.start:
         all_sessions = all_sessions[args.start:]

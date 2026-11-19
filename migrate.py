@@ -14,7 +14,7 @@ Design (following Pi's subagent extension pattern):
 Usage:
   python3 migrate.py --dry-run --limit 5
   python3 migrate.py --all
-  python3 migrate.py --dir /home/sason/life-project
+  python3 migrate.py --dir /path/to/project
 """
 
 import sqlite3
